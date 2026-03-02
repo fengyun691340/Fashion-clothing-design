@@ -41,7 +41,7 @@ import math
 import os
 import random
 import shutil
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -251,6 +251,37 @@ def module_filter_fn(mod: torch.nn.Module, fqn: str):
         if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
             return False
     return True
+
+
+def clone_default_adapter_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Clone the current single LoRA(default adapter) weights as frozen DPO reference."""
+    ref_state = {}
+    for name, param in model.named_parameters():
+        if ".default." in name:
+            ref_state[name] = param.detach().clone()
+    if len(ref_state) == 0:
+        raise ValueError("No default LoRA adapter parameters found. Please check LoRA initialization.")
+    return ref_state
+
+
+@contextmanager
+def use_reference_lora_weights(model: torch.nn.Module, reference_state: dict[str, torch.Tensor]):
+    """Temporarily swap current single LoRA(default) weights with frozen reference weights."""
+    backup_state = {}
+    named_params = dict(model.named_parameters())
+    with torch.no_grad():
+        for name, ref_weight in reference_state.items():
+            if name not in named_params:
+                raise ValueError(f"Missing parameter when loading reference LoRA state: {name}")
+            backup_state[name] = named_params[name].detach().clone()
+            named_params[name].copy_(ref_weight.to(device=named_params[name].device, dtype=named_params[name].dtype))
+
+    try:
+        yield
+    finally:
+        with torch.no_grad():
+            for name, old_weight in backup_state.items():
+                named_params[name].copy_(old_weight)
 
 
 def parse_args(input_args=None):
@@ -573,6 +604,19 @@ def parse_args(input_args=None):
         default=1.29,
         help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme`.",
     )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=1000.0,
+        help="DPO beta value.",
+    )
+    parser.add_argument(
+        "--init_lora_path",
+        type=str,
+        default=None,
+        help="Path to an existing LoRA directory/checkpoint to continue fine-tuning with single-adapter DPO.",
+    )
+
     parser.add_argument(
         "--optimizer",
         type=str,
@@ -908,7 +952,7 @@ def main(args):
     else:
         target_modules = ["to_k", "to_q", "to_v", "to_out.0"]
 
-    # now we will add new LoRA weights the transformer layers
+    # Add a single LoRA adapter for continued DPO fine-tuning.
     transformer_lora_config = LoraConfig(
         r=args.rank,
         lora_alpha=args.lora_alpha,
@@ -916,27 +960,18 @@ def main(args):
         init_lora_weights="gaussian",
         target_modules=target_modules,
     )
-    # transformer.add_adapter(transformer_lora_config)
-    # 1. 添加用于训练的适配器 (default)
     transformer.add_adapter(transformer_lora_config, adapter_name="default")
-    # 2. 添加作为参考的适配器 (ref)
-    transformer.add_adapter(transformer_lora_config, adapter_name="ref")
 
-    # 3. 加载你导入的 SFT 权重到两个适配器中
-    if args.resume_from_checkpoint:
-        from safetensors.torch import load_file
-        from peft import set_peft_model_state_dict
-        
-        sft_weights = load_file(os.path.join(args.resume_from_checkpoint, "pytorch_lora_weights.safetensors"))
-        # 为两个 adapter 都加载相同的初始 SFT 权重
-        set_peft_model_state_dict(transformer, sft_weights, adapter_name="default")
-        set_peft_model_state_dict(transformer, sft_weights, adapter_name="ref")
+    # Load an existing LoRA as initialization (continue training on the same LoRA).
+    if args.init_lora_path:
+        lora_state_dict = Flux2KleinPipeline.lora_state_dict(args.init_lora_path)
+        transformer_state_dict = {
+            f"{k.replace('transformer.', '')}": v for k, v in lora_state_dict.items() if k.startswith("transformer.")
+        }
+        transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
+        set_peft_model_state_dict(transformer, transformer_state_dict, adapter_name="default")
 
-    # 4. 锁定 ref 不参与梯度更新
     transformer.set_adapter("default")
-    for name, param in transformer.named_parameters():
-        if "ref" in name:
-            param.requires_grad = False
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -1334,6 +1369,8 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
+    reference_lora_state = clone_default_adapter_state(transformer)
+
     def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
         sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
         schedule_timesteps = noise_scheduler_copy.timesteps.to(accelerator.device)
@@ -1373,7 +1410,7 @@ def main(args):
                     latents_w = (latents_w - latents_bn_mean) / latents_bn_std
 
                     # 获取 Rejected Latents (y_l) - 假设你的 batch 中有此 key
-                    pixel_values_l = batch["pixel_values_bad"].to(dtype=vae.dtype) 
+                    pixel_values_l = batch["bad_pixel_values"].to(dtype=vae.dtype) 
                     latents_l = vae.encode(pixel_values_l).latent_dist.mode()
                     latents_l = Flux2KleinPipeline._patchify_latents(latents_l)
                     latents_l = (latents_l - latents_bn_mean) / latents_bn_std
@@ -1451,19 +1488,18 @@ def main(args):
                 # with accelerator.accumulate(transformer):
                 # --- A. 计算 Reference Model 的预测 (使用初始 SFT 权重) ---
                 with torch.no_grad():
-                    transformer.set_adapter("ref") # 切换到冻结的 SFT 权重
-                    ref_pred = transformer(
-                        hidden_states=input_combined,
-                        timestep=timesteps_c / 1000,
-                        guidance=guidance,
-                        encoder_hidden_states=prompt_embeds_c,
-                        txt_ids=text_ids_c,
-                        img_ids=ids_combined,
-                        return_dict=False,
-                    )[0]
-                
+                    with use_reference_lora_weights(transformer, reference_lora_state):
+                        ref_pred = transformer(
+                            hidden_states=input_combined,
+                            timestep=timesteps_c / 1000,
+                            guidance=guidance,
+                            encoder_hidden_states=prompt_embeds_c,
+                            txt_ids=text_ids_c,
+                            img_ids=ids_combined,
+                            return_dict=False,
+                        )[0]
+
                 # B. 计算 Learner Loss (激活 LoRA)
-                transformer.set_adapter("default") # 切换回正在练的权重
                 model_pred = transformer(
                     hidden_states=input_combined,
                     timestep=timesteps_c / 1000,
