@@ -275,6 +275,14 @@ def parse_args(input_args=None):
         help="Quantization config in a JSON file that will be used to define the bitsandbytes quant config of the DiT.",
     )
     parser.add_argument(
+        "--use_bnb_4bit_preset",
+        action="store_true",
+        help=(
+            "Use the built-in 4-bit NF4 bitsandbytes config via --bnb_quantization_config_path "
+            "for lower VRAM training."
+        ),
+    )
+    parser.add_argument(
         "--do_fp8_training",
         action="store_true",
         help="if we are doing FP8 training.",
@@ -355,7 +363,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--max_sequence_length",
         type=int,
-        default=512,
+        default=256,
         help="Maximum sequence length to use with with the T5 text encoder",
     )
     parser.add_argument(
@@ -458,10 +466,10 @@ def parse_args(input_args=None):
         help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
-        "--sample_batch_size", type=int, default=4, help="Batch size (per device) for sampling images."
+        "--sample_batch_size", type=int, default=1, help="Batch size (per device) for sampling images."
     )
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument(
@@ -552,6 +560,12 @@ def parse_args(input_args=None):
         help=(
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
+    )
+    parser.add_argument(
+        "--empty_cache_every_n_steps",
+        type=int,
+        default=10,
+        help="Call torch.cuda.empty_cache() every N optimizer steps. Set 0 to disable.",
     )
     parser.add_argument(
         "--weighting_scheme",
@@ -699,6 +713,23 @@ def parse_args(input_args=None):
         action="store_true",
         help="Whether to offload the VAE and the text encoder to CPU when they are not used.",
     )
+    parser.add_argument(
+        "--use_qlora",
+        action="store_true",
+        help="Enable QLoRA by loading the transformer in 4-bit (bitsandbytes).",
+    )
+    parser.add_argument(
+        "--qlora_4bit_quant_type",
+        type=str,
+        default="nf4",
+        choices=["nf4", "fp4"],
+        help="4-bit quantization type used by QLoRA.",
+    )
+    parser.add_argument(
+        "--qlora_use_double_quant",
+        action="store_true",
+        help="Enable nested (double) quantization for QLoRA.",
+    )
 
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument("--enable_npu_flash_attention", action="store_true", help="Enabla Flash Attention for NPU")
@@ -722,6 +753,22 @@ def parse_args(input_args=None):
 
     if args.dataset_name is not None and args.instance_data_dir is not None:
         raise ValueError("Specify only one of `--dataset_name` or `--instance_data_dir`")
+
+    if args.use_bnb_4bit_preset:
+        default_bnb_cfg = Path(__file__).with_name("configs_bnb_4bit_nf4.json")
+        args.bnb_quantization_config_path = str(default_bnb_cfg)
+
+    if args.use_qlora and args.offload:
+        raise ValueError("`--use_qlora` cannot be used together with `--offload`. Please disable offload.")
+
+    if args.use_qlora and args.bnb_quantization_config_path is not None:
+        raise ValueError("Use either `--use_qlora` or `--bnb_quantization_config_path`, but not both.")
+
+    if args.do_fp8_training and (args.use_qlora or args.bnb_quantization_config_path is not None):
+        raise ValueError(
+            "`--do_fp8_training` cannot be combined with 4-bit/bitsandbytes quantized training "
+            "(`--use_qlora` or `--bnb_quantization_config_path`). Disable FP8 or disable quantization."
+        )
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -828,7 +875,16 @@ def main(args):
     )
 
     quantization_config = None
-    if args.bnb_quantization_config_path is not None:
+    if args.use_qlora:
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type=args.qlora_4bit_quant_type,
+            bnb_4bit_use_double_quant=args.qlora_use_double_quant,
+            bnb_4bit_compute_dtype=weight_dtype,
+        )
+    elif args.bnb_quantization_config_path is not None:
+        if not os.path.exists(args.bnb_quantization_config_path):
+            raise ValueError(f"bitsandbytes config not found: {args.bnb_quantization_config_path}")
         with open(args.bnb_quantization_config_path, "r") as f:
             config_kwargs = json.load(f)
             if "load_in_4bit" in config_kwargs and config_kwargs["load_in_4bit"]:
@@ -843,7 +899,7 @@ def main(args):
         quantization_config=quantization_config,
         torch_dtype=weight_dtype,
     )
-    if args.bnb_quantization_config_path is not None:
+    if args.use_qlora or args.bnb_quantization_config_path is not None:
         transformer = prepare_model_for_kbit_training(transformer, use_gradient_checkpointing=False)
 
     text_encoder = Qwen3ForCausalLM.from_pretrained(
@@ -874,7 +930,7 @@ def main(args):
     # we never offload the transformer to CPU, so we can just use the accelerator device
     transformer_to_kwargs = (
         {"device": accelerator.device}
-        if args.bnb_quantization_config_path is not None
+        if args.use_qlora or args.bnb_quantization_config_path is not None
         else {"device": accelerator.device, "dtype": weight_dtype}
     )
 
@@ -1360,14 +1416,12 @@ def main(args):
 
                         # === 处理多个条件图 ===
                         # batch["cond_pixel_values"]: List[Tensor], each (B, 3, H, W), length = N_cond
-                        cond_latents_list = []
                         packed_latents_list = []
 
                         for cond_img in batch["cond_pixel_values"]:
                             # cond_img: (B, 3, H, W)
                             cond_img = cond_img.to(dtype=vae.dtype)
                             latent = vae.encode(cond_img).latent_dist.mode()  # (B, C, h, w)
-                            cond_latents_list.append(latent)
 
                             # Patchify each condition latent
                             # print(latent.shape)
@@ -1478,7 +1532,8 @@ def main(args):
 
                 # Concatenate all reference tokens along sequence dimension
                 packed_cond_model_input = torch.cat(packed_latents, dim=1)  # (N*1024, 128)
-              
+                del packed_latents, packed_latents_list
+
                 # packed_cond_model_input = Flux2KleinPipeline._pack_latents(cond_model_input)
                 orig_input_shape = packed_noisy_model_input.shape
                 orig_input_ids_shape = model_input_ids.shape
@@ -1535,12 +1590,15 @@ def main(args):
 
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
+
+                if torch.cuda.is_available() and args.empty_cache_every_n_steps > 0 and global_step % args.empty_cache_every_n_steps == 0:
+                    torch.cuda.empty_cache()
 
                 if accelerator.is_main_process or is_fsdp:
                     if global_step % args.checkpointing_steps == 0:
@@ -1608,7 +1666,7 @@ def main(args):
     if accelerator.is_main_process:
         modules_to_save = {}
         if is_fsdp:
-            if args.bnb_quantization_config_path is None:
+            if not (args.use_qlora or args.bnb_quantization_config_path is not None):
                 if args.upcast_before_saving:
                     state_dict = {
                         k: v.to(torch.float32) if isinstance(v, torch.Tensor) else v for k, v in state_dict.items()
@@ -1629,7 +1687,7 @@ def main(args):
 
         else:
             transformer = unwrap_model(transformer)
-            if args.bnb_quantization_config_path is None:
+            if not (args.use_qlora or args.bnb_quantization_config_path is not None):
                 if args.upcast_before_saving:
                     transformer.to(torch.float32)
                 else:
