@@ -41,7 +41,7 @@ import math
 import os
 import random
 import shutil
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -253,35 +253,8 @@ def module_filter_fn(mod: torch.nn.Module, fqn: str):
     return True
 
 
-def clone_default_adapter_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """Clone the current single LoRA(default adapter) weights as frozen DPO reference."""
-    ref_state = {}
-    for name, param in model.named_parameters():
-        if ".default." in name:
-            ref_state[name] = param.detach().clone()
-    if len(ref_state) == 0:
-        raise ValueError("No default LoRA adapter parameters found. Please check LoRA initialization.")
-    return ref_state
-
-
-@contextmanager
-def use_reference_lora_weights(model: torch.nn.Module, reference_state: dict[str, torch.Tensor]):
-    """Temporarily swap current single LoRA(default) weights with frozen reference weights."""
-    backup_state = {}
-    named_params = dict(model.named_parameters())
-    with torch.no_grad():
-        for name, ref_weight in reference_state.items():
-            if name not in named_params:
-                raise ValueError(f"Missing parameter when loading reference LoRA state: {name}")
-            backup_state[name] = named_params[name].detach().clone()
-            named_params[name].copy_(ref_weight.to(device=named_params[name].device, dtype=named_params[name].dtype))
-
-    try:
-        yield
-    finally:
-        with torch.no_grad():
-            for name, old_weight in backup_state.items():
-                named_params[name].copy_(old_weight)
+REFERENCE_ADAPTER_NAME = "reference"
+TRAIN_ADAPTER_NAME = "train"
 
 
 def parse_args(input_args=None):
@@ -607,14 +580,23 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--beta",
         type=float,
-        default=1000.0,
-        help="DPO beta value.",
+        default=100.0,
+        help="DPO beta value. If preference learning is unstable, start from 10~100 and tune upward.",
     )
     parser.add_argument(
         "--init_lora_path",
         type=str,
         default=None,
-        help="Path to an existing LoRA directory/checkpoint to continue fine-tuning with single-adapter DPO.",
+        help="Path to the frozen reference LoRA used by DPO.",
+    )
+    parser.add_argument(
+        "--train_init_lora_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to initialize the trainable LoRA. "
+            "If unset, it will be initialized from --init_lora_path when provided; otherwise random init."
+        ),
     )
 
     parser.add_argument(
@@ -958,7 +940,7 @@ def main(args):
     else:
         target_modules = ["to_k", "to_q", "to_v", "to_out.0"]
 
-    # Add a single LoRA adapter for continued DPO fine-tuning.
+    # Add two LoRA adapters: one frozen reference + one trainable learner.
     transformer_lora_config = LoraConfig(
         r=args.rank,
         lora_alpha=args.lora_alpha,
@@ -966,18 +948,33 @@ def main(args):
         init_lora_weights="gaussian",
         target_modules=target_modules,
     )
-    transformer.add_adapter(transformer_lora_config, adapter_name="default")
+    transformer.add_adapter(transformer_lora_config, adapter_name=REFERENCE_ADAPTER_NAME)
+    transformer.add_adapter(transformer_lora_config, adapter_name=TRAIN_ADAPTER_NAME)
 
-    # Load an existing LoRA as initialization (continue training on the same LoRA).
     if args.init_lora_path:
         lora_state_dict = Flux2KleinPipeline.lora_state_dict(args.init_lora_path)
         transformer_state_dict = {
             f"{k.replace('transformer.', '')}": v for k, v in lora_state_dict.items() if k.startswith("transformer.")
         }
         transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
-        set_peft_model_state_dict(transformer, transformer_state_dict, adapter_name="default")
+        set_peft_model_state_dict(transformer, transformer_state_dict, adapter_name=REFERENCE_ADAPTER_NAME)
 
-    transformer.set_adapter("default")
+    train_lora_path = args.train_init_lora_path if args.train_init_lora_path else args.init_lora_path
+    if train_lora_path:
+        lora_state_dict = Flux2KleinPipeline.lora_state_dict(train_lora_path)
+        transformer_state_dict = {
+            f"{k.replace('transformer.', '')}": v for k, v in lora_state_dict.items() if k.startswith("transformer.")
+        }
+        transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
+        set_peft_model_state_dict(transformer, transformer_state_dict, adapter_name=TRAIN_ADAPTER_NAME)
+
+    for name, param in transformer.named_parameters():
+        if f".{REFERENCE_ADAPTER_NAME}." in name:
+            param.requires_grad_(False)
+        elif f".{TRAIN_ADAPTER_NAME}." in name:
+            param.requires_grad_(True)
+
+    transformer.set_adapter(TRAIN_ADAPTER_NAME)
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -1014,6 +1011,7 @@ def main(args):
 
             transformer_lora_layers_to_save = get_peft_model_state_dict(
                 unwrap_model(transformer_model) if is_fsdp else transformer_model,
+                adapter_name=TRAIN_ADAPTER_NAME,
                 **peft_kwargs,
             )
 
@@ -1046,7 +1044,7 @@ def main(args):
                 args.pretrained_model_name_or_path,
                 subfolder="transformer",
             )
-            transformer_.add_adapter(transformer_lora_config)
+            transformer_.add_adapter(transformer_lora_config, adapter_name=TRAIN_ADAPTER_NAME)
 
         lora_state_dict = Flux2KleinPipeline.lora_state_dict(input_dir)
 
@@ -1054,7 +1052,9 @@ def main(args):
             f"{k.replace('transformer.', '')}": v for k, v in lora_state_dict.items() if k.startswith("transformer.")
         }
         transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
-        incompatible_keys = set_peft_model_state_dict(transformer_, transformer_state_dict, adapter_name="default")
+        incompatible_keys = set_peft_model_state_dict(
+            transformer_, transformer_state_dict, adapter_name=TRAIN_ADAPTER_NAME
+        )
         if incompatible_keys is not None:
             # check only for unexpected keys
             unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
@@ -1370,7 +1370,9 @@ def main(args):
                     if k.startswith("transformer.")
                 }
                 transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
-                set_peft_model_state_dict(unwrap_model(transformer), transformer_state_dict, adapter_name="default")
+                set_peft_model_state_dict(
+                    unwrap_model(transformer), transformer_state_dict, adapter_name=TRAIN_ADAPTER_NAME
+                )
                 initial_global_step = 0
                 first_epoch = 0
             else:
@@ -1391,8 +1393,6 @@ def main(args):
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-
-    reference_lora_state = clone_default_adapter_state(transformer)
 
     def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
         sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
@@ -1519,18 +1519,20 @@ def main(args):
                 # with accelerator.accumulate(transformer):
                 # --- A. 计算 Reference Model 的预测 (使用初始 SFT 权重) ---
                 with torch.no_grad():
-                    with use_reference_lora_weights(transformer, reference_lora_state):
-                        ref_pred = transformer(
-                            hidden_states=input_combined,
-                            timestep=timesteps_c / 1000,
-                            guidance=guidance,
-                            encoder_hidden_states=prompt_embeds_c,
-                            txt_ids=text_ids_c,
-                            img_ids=ids_combined,
-                            return_dict=False,
-                        )[0]
+                    transformer.set_adapter(REFERENCE_ADAPTER_NAME)
+                    ref_pred = transformer(
+                        hidden_states=input_combined,
+                        timestep=timesteps_c / 1000,
+                        guidance=guidance,
+                        encoder_hidden_states=prompt_embeds_c,
+                        txt_ids=text_ids_c,
+                        img_ids=ids_combined,
+                        return_dict=False,
+                    )[0]
+                    transformer.set_adapter(TRAIN_ADAPTER_NAME)
 
                 # B. 计算 Learner Loss (激活 LoRA)
+                transformer.set_adapter(TRAIN_ADAPTER_NAME)
                 model_pred = transformer(
                     hidden_states=input_combined,
                     timestep=timesteps_c / 1000,
@@ -1550,7 +1552,8 @@ def main(args):
                 model_input_ids_pair = torch.cat([model_input_ids_w, model_input_ids_w], dim=0)
                 ref_pred = Flux2KleinPipeline._unpack_latents_with_ids(ref_pred, model_input_ids_pair)
                 model_pred = Flux2KleinPipeline._unpack_latents_with_ids(model_pred, model_input_ids_pair)
-                target = noise - torch.cat([latents_w, latents_l], dim=0)
+                noise_pair = torch.cat([noise, noise], dim=0)
+                target = noise_pair - torch.cat([latents_w, latents_l], dim=0)
                 
                 # target = noise - torch.cat([latents_w, latents_l], dim=0)
                 weighting = compute_loss_weighting_for_sd3(args.weighting_scheme, sigmas)
@@ -1570,6 +1573,7 @@ def main(args):
                 # implicit_acc = ( (ref_l_err - model_l_err) > (ref_w_err - model_w_err) )
                 w_l_diff = (model_w_err - ref_w_err) - (model_l_err - ref_l_err)
                 loss = -torch.nn.functional.logsigmoid(-0.5 * args.beta * w_l_diff).mean()
+                implicit_acc = (-0.5 * args.beta * w_l_diff > 0).float().mean()
 
                 # --- 后续更新 ---
                 accelerator.backward(loss)
@@ -1609,7 +1613,12 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {
+                "loss": loss.detach().item(),
+                "lr": lr_scheduler.get_last_lr()[0],
+                "w_l_diff": w_l_diff.detach().mean().item(),
+                "implicit_acc": implicit_acc.detach().item(),
+            }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
